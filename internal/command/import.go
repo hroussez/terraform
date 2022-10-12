@@ -25,6 +25,12 @@ type ImportCommand struct {
 	Meta
 }
 
+type resourceImport struct {
+	addr addrs.AbsResourceInstance
+	id   string
+	rc   *configs.Resource
+}
+
 func (c *ImportCommand) Run(args []string) int {
 	// Get the pwd since its our default -config flag value
 	pwd, err := os.Getwd()
@@ -52,35 +58,20 @@ func (c *ImportCommand) Run(args []string) int {
 	}
 
 	args = cmdFlags.Args()
-	if len(args) != 2 {
-		c.Ui.Error("The import command expects two arguments.")
-		cmdFlags.Usage()
-		return 1
-	}
+	// if len(args) != 2 {
+	// 	c.Ui.Error("The import command expects two arguments.")
+	// 	cmdFlags.Usage()
+	// 	return 1
+	// }
 
 	var diags tfdiags.Diagnostics
 
-	// Parse the provided resource address.
-	traversalSrc := []byte(args[0])
-	traversal, travDiags := hclsyntax.ParseTraversalAbs(traversalSrc, "<import-address>", hcl.Pos{Line: 1, Column: 1})
-	diags = diags.Append(travDiags)
-	if travDiags.HasErrors() {
-		c.registerSynthConfigSource("<import-address>", traversalSrc) // so we can include a source snippet
-		c.showDiagnostics(diags)
-		c.Ui.Info(importCommandInvalidAddressReference)
-		return 1
-	}
-	addr, addrDiags := addrs.ParseAbsResourceInstance(traversal)
-	diags = diags.Append(addrDiags)
-	if addrDiags.HasErrors() {
-		c.registerSynthConfigSource("<import-address>", traversalSrc) // so we can include a source snippet
-		c.showDiagnostics(diags)
-		c.Ui.Info(importCommandInvalidAddressReference)
-		return 1
-	}
-
-	if addr.Resource.Resource.Mode != addrs.ManagedResourceMode {
-		diags = diags.Append(errors.New("A managed resource address is required. Importing into a data resource is not allowed."))
+	if len(args)%2 != 0 {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Invalid import format",
+			"The import command expects two arguments per resource to import, but received an odd number of arguments.",
+		))
 		c.showDiagnostics(diags)
 		return 1
 	}
@@ -107,52 +98,86 @@ func (c *ImportCommand) Run(args []string) int {
 		return 1
 	}
 
-	// Verify that the given address points to something that exists in config.
-	// This is to reduce the risk that a typo in the resource address will
-	// import something that Terraform will want to immediately destroy on
-	// the next plan, and generally acts as a reassurance of user intent.
-	targetConfig := config.DescendentForInstance(addr.Module)
-	if targetConfig == nil {
-		modulePath := addr.Module.String()
-		diags = diags.Append(&hcl.Diagnostic{
-			Severity: hcl.DiagError,
-			Summary:  "Import to non-existent module",
-			Detail: fmt.Sprintf(
-				"%s is not defined in the configuration. Please add configuration for this module before importing into it.",
-				modulePath,
-			),
+	imports := make([]resourceImport, 0, len(args)/2)
+
+	for i := 0; i < len(args); i += 2 {
+		// Parse the provided resource address.
+		traversalSrc := []byte(args[i])
+		traversal, travDiags := hclsyntax.ParseTraversalAbs(traversalSrc, "<import-address>", hcl.Pos{Line: 1, Column: 1})
+		diags = diags.Append(travDiags)
+		if travDiags.HasErrors() {
+			c.registerSynthConfigSource("<import-address>", traversalSrc) // so we can include a source snippet
+			c.showDiagnostics(diags)
+			c.Ui.Info(importCommandInvalidAddressReference)
+			return 1
+		}
+		addr, addrDiags := addrs.ParseAbsResourceInstance(traversal)
+		diags = diags.Append(addrDiags)
+		if addrDiags.HasErrors() {
+			c.registerSynthConfigSource("<import-address>", traversalSrc) // so we can include a source snippet
+			c.showDiagnostics(diags)
+			c.Ui.Info(importCommandInvalidAddressReference)
+			return 1
+		}
+
+		if addr.Resource.Resource.Mode != addrs.ManagedResourceMode {
+			diags = diags.Append(errors.New("A managed resource address is required. Importing into a data resource is not allowed."))
+			c.showDiagnostics(diags)
+			return 1
+		}
+
+		// Verify that the given address points to something that exists in config.
+		// This is to reduce the risk that a typo in the resource address will
+		// import something that Terraform will want to immediately destroy on
+		// the next plan, and generally acts as a reassurance of user intent.
+		targetConfig := config.DescendentForInstance(addr.Module)
+		if targetConfig == nil {
+			modulePath := addr.Module.String()
+			diags = diags.Append(&hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Import to non-existent module",
+				Detail: fmt.Sprintf(
+					"%s is not defined in the configuration. Please add configuration for this module before importing into it.",
+					modulePath,
+				),
+			})
+			c.showDiagnostics(diags)
+			return 1
+		}
+		targetMod := targetConfig.Module
+		rcs := targetMod.ManagedResources
+		var rc *configs.Resource
+		resourceRelAddr := addr.Resource.Resource
+		for _, thisRc := range rcs {
+			if resourceRelAddr.Type == thisRc.Type && resourceRelAddr.Name == thisRc.Name {
+				rc = thisRc
+				break
+			}
+		}
+		if !c.Meta.allowMissingConfig && rc == nil {
+			modulePath := addr.Module.String()
+			if modulePath == "" {
+				modulePath = "the root module"
+			}
+
+			c.showDiagnostics(diags)
+
+			// This is not a diagnostic because currently our diagnostics printer
+			// doesn't support having a code example in the detail, and there's
+			// a code example in this message.
+			// TODO: Improve the diagnostics printer so we can use it for this
+			// message.
+			c.Ui.Error(fmt.Sprintf(
+				importCommandMissingResourceFmt,
+				addr, modulePath, resourceRelAddr.Type, resourceRelAddr.Name,
+			))
+			return 1
+		}
+		imports = append(imports, resourceImport{
+			addr: addr,
+			id:   args[i+1],
+			rc:   rc,
 		})
-		c.showDiagnostics(diags)
-		return 1
-	}
-	targetMod := targetConfig.Module
-	rcs := targetMod.ManagedResources
-	var rc *configs.Resource
-	resourceRelAddr := addr.Resource.Resource
-	for _, thisRc := range rcs {
-		if resourceRelAddr.Type == thisRc.Type && resourceRelAddr.Name == thisRc.Name {
-			rc = thisRc
-			break
-		}
-	}
-	if !c.Meta.allowMissingConfig && rc == nil {
-		modulePath := addr.Module.String()
-		if modulePath == "" {
-			modulePath = "the root module"
-		}
-
-		c.showDiagnostics(diags)
-
-		// This is not a diagnostic because currently our diagnostics printer
-		// doesn't support having a code example in the detail, and there's
-		// a code example in this message.
-		// TODO: Improve the diagnostics printer so we can use it for this
-		// message.
-		c.Ui.Error(fmt.Sprintf(
-			importCommandMissingResourceFmt,
-			addr, modulePath, resourceRelAddr.Type, resourceRelAddr.Name,
-		))
-		return 1
 	}
 
 	// Check for user-supplied plugin path
@@ -227,17 +252,13 @@ func (c *ImportCommand) Run(args []string) int {
 		}
 	}()
 
-	// Perform the import. Note that as you can see it is possible for this
-	// API to import more than one resource at once. For now, we only allow
-	// one while we stabilize this feature.
-	newState, importDiags := ctx.Import(&terraform.ImportOpts{
-		Targets: []*terraform.ImportTarget{
-			&terraform.ImportTarget{
-				Addr: addr,
-				ID:   args[1],
-			},
-		},
-	})
+	opts := terraform.ImportOpts{}
+	for _, imp := range imports {
+		opts.Targets = append(opts.Targets, &terraform.ImportTarget{Addr: imp.addr, ID: imp.id})
+	}
+
+	// Perform the import.
+	newState, importDiags := ctx.Import(&opts)
 	diags = diags.Append(importDiags)
 	if diags.HasErrors() {
 		c.showDiagnostics(diags)
@@ -257,8 +278,13 @@ func (c *ImportCommand) Run(args []string) int {
 
 	c.Ui.Output(c.Colorize().Color("[reset][green]\n" + importCommandSuccessMsg))
 
-	if c.Meta.allowMissingConfig && rc == nil {
-		c.Ui.Output(c.Colorize().Color("[reset][yellow]\n" + importCommandAllowMissingResourceMsg))
+	if c.Meta.allowMissingConfig {
+		for _, imp := range imports {
+			if imp.rc == nil {
+				c.Ui.Output(c.Colorize().Color("[reset][yellow]\n" + importCommandAllowMissingResourceMsg))
+				break
+			}
+		}
 	}
 
 	c.showDiagnostics(diags)
