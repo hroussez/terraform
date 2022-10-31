@@ -71,7 +71,7 @@ func (c *ImportCommand) Run(args []string) int {
 	imports := make([]*terraform.ImportTarget, 0, len(args)/2)
 	for i := 0; i < len(args); i += 2 {
 		// Parse the provided resource address.
-		traversalSrc := []byte(args[0])
+		traversalSrc := []byte(args[i])
 		traversal, travDiags := hclsyntax.ParseTraversalAbs(traversalSrc, "<import-address>", hcl.Pos{Line: 1, Column: 1})
 		diags = diags.Append(travDiags)
 		if travDiags.HasErrors() {
