@@ -25,11 +25,6 @@ type ImportCommand struct {
 	Meta
 }
 
-type resourceImport struct {
-	addr addrs.AbsResourceInstance
-	id   string
-}
-
 func (c *ImportCommand) Run(args []string) int {
 	// Get the pwd since its our default -config flag value
 	pwd, err := os.Getwd()
@@ -73,7 +68,7 @@ func (c *ImportCommand) Run(args []string) int {
 		return 1
 	}
 
-	imports := make([]resourceImport, 0, len(args)/2)
+	imports := make([]*terraform.ImportTarget, 0, len(args)/2)
 	for i := 0; i < len(args); i += 2 {
 		// Parse the provided resource address.
 		traversalSrc := []byte(args[0])
@@ -161,7 +156,10 @@ func (c *ImportCommand) Run(args []string) int {
 			return 1
 		}
 
-		imports = append(imports, resourceImport{addr: addr, id: args[i+1]})
+		imports = append(imports, &terraform.ImportTarget{
+			Addr: addr,
+			ID:   args[i+1],
+		})
 	}
 
 	// Check for user-supplied plugin path
@@ -237,14 +235,8 @@ func (c *ImportCommand) Run(args []string) int {
 	}()
 
 	opts := terraform.ImportOpts{
-		Targets:      []*terraform.ImportTarget{},
+		Targets:      imports,
 		SetVariables: lr.PlanOpts.SetVariables,
-	}
-	for _, imp := range imports {
-		opts.Targets = append(opts.Targets, &terraform.ImportTarget{
-			Addr: imp.addr,
-			ID:   imp.id,
-		})
 	}
 
 	// Perform the import. Note that as you can see it is possible for this
@@ -276,7 +268,7 @@ func (c *ImportCommand) Run(args []string) int {
 		return 1
 	}
 
-	c.Ui.Output(c.Colorize().Color("[reset][green]\n" + importCommandSuccessMsg))
+	c.Ui.Output(c.Colorize().Color("[reset][green]\n" + importCommandSuccessMsg + fmt.Sprintf("\n%v resources\n", len(imports))))
 
 	c.showDiagnostics(diags)
 	if diags.HasErrors() {
